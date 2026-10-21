@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=NUC 中心
+GenericName=系统管理器
+Comment=监控温度并控制 Intel NUC X15 的风扇、灯效和电池
+Exec=nuc-center
+Icon=nuc-center
+Terminal=false
+Categories=System;Settings;Monitor;
+Keywords=nuc;fan;temperature;battery;rgb;keyboard;uniwill;风扇;温度;键盘;
+StartupWMClass=nuc-center
