@@ -561,7 +561,7 @@ class CoolingPage(Page):
         mode_header.pack_start(
             SectionHeader(
                 "系统性能",
-                "EC 会调整风扇曲线、显卡 TGP 与模式指示灯",
+                "同时切换风扇、CPU PL1/PL2 与显卡 TGP",
             ),
             True,
             True,
@@ -574,9 +574,9 @@ class CoolingPage(Page):
         modes = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10, homogeneous=True)
         self.mode_buttons: dict[str, ModeButton] = {}
         definitions = [
-            ("quiet", "weather-clear-night-symbolic", "安静", "更低功耗，风扇更安静", "green"),
-            ("balanced", "power-profile-balanced-symbolic", "均衡", "日常性能，风扇自动调节", ""),
-            ("performance", "power-profile-performance-symbolic", "性能", "最高显卡功耗，激进散热", "amber"),
+            ("quiet", "weather-clear-night-symbolic", "安静", "CPU 30/60W · GPU 80W", "green"),
+            ("balanced", "power-profile-balanced-symbolic", "均衡", "CPU 45/65W · GPU 100W", ""),
+            ("performance", "power-profile-performance-symbolic", "性能", "CPU 65/90W · GPU 125W", "amber"),
         ]
         for mode, icon, title, subtitle, color_class in definitions:
             button = ModeButton(mode, icon, title, subtitle, color_class)
@@ -598,6 +598,34 @@ class CoolingPage(Page):
         )
         mode_card.pack_start(self.fan_boost_row, False, False, 0)
         self.body.pack_start(mode_card, False, False, 0)
+
+        gpu_card = card(12)
+        gpu_header = hbox(8)
+        gpu_header.pack_start(
+            SectionHeader(
+                "显卡功耗上限",
+                "直接写 EC 的 TGP / Dynamic Boost；Linux 默认只有 80 W",
+            ),
+            True,
+            True,
+            0,
+        )
+        self.gpu_power_pill = Gtk.Label(label="--")
+        self.gpu_power_pill.get_style_context().add_class("pill")
+        gpu_header.pack_end(self.gpu_power_pill, False, False, 0)
+        gpu_card.pack_start(gpu_header, False, False, 0)
+        self.gpu_power_control = SegmentedControl(
+            [("80", "80 W"), ("100", "100 W"), ("125", "125 W")]
+        )
+        self.gpu_power_control.connect_changed(self._gpu_power_changed)
+        gpu_card.pack_start(self.gpu_power_control, False, False, 0)
+        self.gpu_power_note = make_label(
+            "80 W 是 vBIOS 默认；100 W 适合日常；125 W 需要良好的散热。",
+            "subtext",
+            wrap=True,
+        )
+        gpu_card.pack_start(self.gpu_power_note, False, False, 0)
+        self.body.pack_start(gpu_card, False, False, 0)
 
         self._build_curve_card()
         self._curve_debounce = Debouncer(450, self._apply_curve)
@@ -662,7 +690,7 @@ class CoolingPage(Page):
         curve_card = card(10)
         header = hbox(8)
         header.pack_start(
-            SectionHeader("自动散热曲线", "温度 → 百分比，平滑缓升缓降（WMI PWM）"), True, True, 0
+            SectionHeader("自动散热曲线", "温度 → 百分比，写入 EC 风扇表，由 EC 自主执行"), True, True, 0
         )
         self.curve_pill = Pill("自动", "neutral")
         header.pack_end(self.curve_pill, False, False, 0)
@@ -692,7 +720,7 @@ class CoolingPage(Page):
         curve_card.pack_start(grid, False, False, 0)
         self.curve_toggle = ToggleRow(
             "启用自动散热曲线",
-            "每秒按最热温度平滑调整 PWM；关闭或 helper 停止时恢复自动",
+            "曲线写入 EC 后由 EC 执行；关闭时恢复 EC 自动风扇",
             self._curve_toggled,
         )
         curve_card.pack_start(self.curve_toggle, False, False, 0)
@@ -709,8 +737,8 @@ class CoolingPage(Page):
         self.curve_status = make_label("EC 自动风扇控制", "subtext", wrap=True)
         curve_card.pack_start(self.curve_status, False, False, 0)
         note = make_label(
-            "默认曲线已经可用，不需要手工调点。升温每秒最多 +4%（85°C 以上 +8%），"
-            "降温每秒最多 -2%；90°C 立即 100%。实验性 WMI PWM 模块带 5 秒看门狗。",
+            "EC 表有 15 个阈值点，界面的 5 个点会线性展开后写入；EC 按上升/下降温度自主切换。"
+            "不需要内核模块，也不会因为 helper 退出而卡在手动状态。",
             "subtext",
             wrap=True,
         )
@@ -762,7 +790,7 @@ class CoolingPage(Page):
 
     def _curve_toggled(self, enabled: bool) -> None:
         if not self.app.controls.caps.get("fan_curve"):
-            self.app.toast.show("风扇曲线模块未加载（/dev/uniwill_pwm）。", "error")
+            self.app.toast.show("EC 风扇表不可用。", "error")
             self.curve_toggle.set_active(False)
             return
         self._curve_user_at = time.monotonic()
@@ -847,12 +875,48 @@ class CoolingPage(Page):
         self.mode_pill.set_text(pill_text)
         self.mode_pill.get_style_context().remove_class("warn")
         self.mode_pill.get_style_context().remove_class("neutral")
+        curve_active = bool((state.get("fan_curve") or {}).get("enabled"))
         self.mode_pill.get_style_context().add_class(
             "warn" if (boost and not curve_active) or not profile else "neutral"
         )
 
+    def _gpu_power_changed(self, watts: str) -> None:
+        if not self.app.controls.caps.get("gpu_power"):
+            self.app.toast.show("此 EC 不支持显卡功耗控制。", "error")
+            self._sync_gpu_power()
+            return
+        try:
+            self.app.controls.set_gpu_power(int(watts))
+            self.app.toast.show(f"显卡功耗上限：{watts} W", "success")
+            self.app.refresh_controls_async()
+        except ControlError as exc:
+            self.app.toast.show(str(exc), "error")
+            self._sync_gpu_power()
+
+    def _sync_gpu_power(self) -> None:
+        state = self.app.state or {}
+        ec = state.get("ec") or {}
+        watts = ec.get("gpu_power")
+        supported = bool(self.app.controls.caps.get("gpu_power"))
+        self.gpu_power_control.set_sensitive(supported)
+        context = self.gpu_power_pill.get_style_context()
+        context.remove_class("warn")
+        context.remove_class("neutral")
+        if not supported:
+            self.gpu_power_pill.set_text("不可用")
+            context.add_class("neutral")
+            return
+        if watts is None:
+            self.gpu_power_pill.set_text("--")
+            context.add_class("neutral")
+            return
+        self.gpu_power_control.set_active(str(watts))
+        self.gpu_power_pill.set_text(f"{watts} W")
+        context.add_class("warn" if watts >= 125 else "neutral")
+
     def controls_updated(self, state: dict) -> None:
         self._sync_modes()
+        self._sync_gpu_power()
         caps = self.app.controls.caps
         curve = state.get("fan_curve") or {}
         supported = bool(caps.get("fan_curve")) and self.app.controls.can_control
@@ -873,9 +937,10 @@ class CoolingPage(Page):
         self.curve_chart.set_current(temp, percent)
         if not supported:
             self.curve_pill.set_text("未加载", "warn")
-            self.curve_status.set_text("风扇曲线模块未加载；使用 EC 自动风扇。")
+            self.curve_status.set_text("EC 风扇表不可用；使用 EC 自动风扇。")
         elif curve_enabled:
-            self.curve_pill.set_text("手动曲线", "warn")
+            label = "EC 表" if curve.get("source") == "ec_table" else "手动曲线"
+            self.curve_pill.set_text(label, "warn")
             if temp is not None:
                 target = curve.get("target")
                 self.curve_status.set_text(

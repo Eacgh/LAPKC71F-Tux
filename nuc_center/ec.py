@@ -14,6 +14,10 @@ out-of-tree ``qc71_laptop`` driver):
     0x0740     project id
     0x0741     AP OEM (manual control enable, fan abnormal)
     0x0742     support 5 (fan support)
+    0x0743     GPU power control flags (enable / Dynamic Boost / TGP)
+    0x0744     GPU CTGP offset in watts
+    0x0745     Dynamic Boost companion value (45 when enabled)
+    0x0746     Dynamic Boost watts
     0x0748     lightbar control
     0x0749..   lightbar RGB
     0x074E     BIOS OEM (fn lock)
@@ -23,7 +27,10 @@ out-of-tree ``qc71_laptop`` driver):
     0x0768     switch status
     0x0769..   keyboard RGB intensity
     0x0782     BIOS OEM 2 (China mode enable)
+    0x0783     CPU PL1 (watts)
+    0x0784     CPU PL2 (watts)
     0x078C     keyboard status / brightness
+    0x07AB     performance-mode indicator LED
 """
 
 from __future__ import annotations
@@ -34,6 +41,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from .fan import interpolate, normalize_points
 from .util import clamp, parse_hex, run_command
 
 # EC registers used by this application.
@@ -57,6 +65,33 @@ EC_BIOS_OEM_3 = 0x07A3
 EC_OEM_3 = 0x07A5
 EC_OEM_4 = 0x07A6
 EC_CHARGE_CTRL = 0x07B9
+
+# GPU power budget block.  NUC Studio writes these four registers when the
+# user picks a performance profile; the NVIDIA driver only reads the result,
+# which is why ``nvidia-smi -pl`` has no effect on this laptop.
+EC_GPU_TGP_CONTROL = 0x0743
+EC_GPU_CTGP = 0x0744
+EC_GPU_DB_CAP = 0x0745
+EC_GPU_DB_WATT = 0x0746
+EC_CPU_PL1 = 0x0783
+EC_CPU_PL2 = 0x0784
+EC_MODE_LED = 0x07AB
+
+# EC fan-table block (16 slots, slot 0 is a fixed sentinel).  Writing the
+# tables and clearing the duty of slot 0 makes the EC run the curve on its
+# own; slot 0 duty 0xFF hands control back to the EC's built-in curve.
+EC_FAN_CPU_UP = 0x0F00
+EC_FAN_CPU_DOWN = 0x0F10
+EC_FAN_CPU_DUTY = 0x0F20
+EC_FAN_GPU_UP = 0x0F30
+EC_FAN_GPU_DOWN = 0x0F40
+EC_FAN_GPU_DUTY = 0x0F50
+EC_FAN_SPLIT = 0x07C5
+EC_FAN_TABLE_ENABLE = 0x07C6
+EC_FAN_SPLIT_ENABLE = 0x80
+EC_FAN_TABLE_ENABLE_BIT = 0x04
+EC_FAN_MODE_MANUAL_MASK = 0x40
+FAN_TABLE_SLOTS = 15
 
 # Bits.
 AP_OEM_ENABLE_MANUAL_CTRL = 1 << 0
@@ -89,14 +124,113 @@ PERF_MODE_VALUES = {
     "performance": PERF_MODE_TURBO,
 }
 
-# The NUC X15's EC uses a different encoding than the newer Uniwill models:
-# 0x10/0x20/0x30 are the three firmware modes and are consumed as one-shot
-# commands (the register clears afterwards).
+# The NUC X15 uses a different encoding in EC_MANUAL_FAN_CTRL.  Both values
+# below were read back from a LAPKC71F running NUC Studio: Balanced leaves
+# 0x0751 at 0x00, Performance sets 0x10 (the firmware's "Turbo" bit).  The
+# previous 0x10/0x20/0x30 table was wrong: 0x10 made the "quiet" button pick
+# Turbo, and 0x20/0x30 are not part of the firmware's fan-control flags.
+# This firmware has no separate "quiet" byte; a real quiet profile needs the
+# EC fan table (0xF00 block), which is not implemented yet.
 NUC_PERF_MODE_VALUES = {
-    "quiet": 0x10,
-    "balanced": 0x20,
-    "performance": 0x30,
+    "balanced": 0x00,
+    "performance": 0x10,
 }
+
+# GPU power budget: (CTGP offset W, Dynamic Boost W, 0x0745 companion value).
+# Read back from NUC Studio: BatterySaver 80 W, Balanced 100 W, Performance
+# 125 W, Benchmark 145 W.  Effective TGP = 80 + CTGP + Dynamic Boost.
+GPU_BASE_POWER = 80
+GPU_POWER_MODES = {
+    80: (0, 0, 0),
+    100: (0, 20, 45),
+    125: (25, 20, 45),
+    145: (45, 20, 45),
+}
+GPU_CTRL_ENABLE = 0x01
+GPU_CTRL_DYNAMIC_BOOST = 0x02
+GPU_CTRL_TGP = 0x04
+
+# Full power profiles, matching the three EC default PL tables:
+# 0x0730/0x0731 = 45/65 W, 0x0734/0x0735 = 30/60 W, 0x07A7/0x07A8 = 65/90 W.
+POWER_PROFILES = {
+    "quiet": {"gpu_power": 80, "pl1": 30, "pl2": 60, "fan": 0x00, "led": 0x03},
+    "balanced": {"gpu_power": 100, "pl1": 45, "pl2": 65, "fan": 0x00, "led": 0x02},
+    "performance": {"gpu_power": 125, "pl1": 65, "pl2": 90, "fan": 0x10, "led": 0x01},
+}
+
+
+def gpu_power_registers(watts: int, current_control: int = 0) -> dict:
+    """Return the EC writes that select ``watts`` on a LAPKC71F.
+
+    0x0743 is a flag byte (bit0 enable, bit1 Dynamic Boost, bit2 TGP
+    offset); bits outside those three are preserved.  The order matches what
+    NUC Studio does: values first, 0x0743 last.
+    """
+    if watts not in GPU_POWER_MODES:
+        raise ValueError(f"unsupported GPU power limit: {watts} W")
+    ctgp, dynamic_boost, companion = GPU_POWER_MODES[watts]
+    control = current_control & ~(GPU_CTRL_DYNAMIC_BOOST | GPU_CTRL_TGP)
+    control |= GPU_CTRL_ENABLE
+    if dynamic_boost:
+        control |= GPU_CTRL_DYNAMIC_BOOST
+    if ctgp:
+        control |= GPU_CTRL_TGP
+    return {
+        EC_GPU_CTGP: ctgp,
+        EC_GPU_DB_CAP: companion,
+        EC_GPU_DB_WATT: dynamic_boost,
+        EC_GPU_TGP_CONTROL: control,
+    }
+
+
+def expand_fan_curve(points, slots: int = FAN_TABLE_SLOTS) -> list[tuple[int, int]]:
+    """Expand a user curve into the EC's fixed 15-slot table.
+
+    The EC has 15 usable slots (1..15) and runs its own hysteresis, so the
+    handful of UI points are sampled evenly over their temperature range.
+    """
+    curve = normalize_points(points)
+    low = curve[0].temp
+    high = curve[-1].temp
+    if high <= low:
+        high = low + 1
+    result: list[tuple[int, int]] = []
+    for index in range(slots):
+        temperature = low + (high - low) * index / (slots - 1)
+        result.append((int(round(temperature)), int(interpolate(curve, temperature))))
+    return result
+
+
+def fan_table_writes(points, slots: int = FAN_TABLE_SLOTS) -> list[tuple[int, int]]:
+    """Return the ordered EC writes for a 15-point table.
+
+    Slot 0 is fixed (20/17/0).  Duty is the UI percentage multiplied by two,
+    matching what the OEM software writes.
+    """
+    curve = expand_fan_curve(points, slots)
+    writes: list[tuple[int, int]] = [
+        (EC_FAN_CPU_UP, 20),
+        (EC_FAN_CPU_DOWN, 17),
+        (EC_FAN_CPU_DUTY, 0),
+        (EC_FAN_GPU_UP, 20),
+        (EC_FAN_GPU_DOWN, 17),
+        (EC_FAN_GPU_DUTY, 0),
+    ]
+    for index, (temperature, percent) in enumerate(curve, start=1):
+        up = max(0, min(255, int(temperature)))
+        down = max(0, up - 3)
+        duty = max(0, min(200, int(percent) * 2))
+        writes.extend(
+            (
+                (EC_FAN_CPU_UP + index, up),
+                (EC_FAN_CPU_DOWN + index, down),
+                (EC_FAN_CPU_DUTY + index, duty),
+                (EC_FAN_GPU_UP + index, up),
+                (EC_FAN_GPU_DOWN + index, down),
+                (EC_FAN_GPU_DUTY + index, duty),
+            )
+        )
+    return writes
 
 KBD_MAX_LEVEL = 4
 KBD_MAX_INTENSITY = 50
@@ -127,6 +261,7 @@ class AcpiEc:
         # the last mode we set so the UI does not fall back to "balanced"
         # immediately after a successful change.
         self._last_perf_mode: Optional[str] = None
+        self._fan_table_active = False
 
     # ------------------------------------------------------------------
     # low level plumbing
@@ -233,6 +368,11 @@ class AcpiEc:
             "lightbar_ctrl": None,
             "lightbar_rgb": None,
             "ap_oem": None,
+            "gpu_power": None,
+            "gpu_control": None,
+            "gpu_ctgp": None,
+            "gpu_db": None,
+            "fan_table": None,
         }
         if not self.available:
             state["error"] = self.last_error
@@ -261,6 +401,17 @@ class AcpiEc:
         light_ctrl = get(EC_LIGHTBAR_CTRL)
         light_rgb = [get(address) for address in EC_LIGHTBAR_RGB]
         ap_oem = get(EC_AP_OEM)
+        gpu_ctrl = get(EC_GPU_TGP_CONTROL)
+        gpu_ctgp = get(EC_GPU_CTGP)
+        gpu_db = get(EC_GPU_DB_WATT)
+        fan_duty = get(EC_FAN_CPU_DUTY)
+        fan_table = None if fan_duty is None else fan_duty != 0xFF
+        if gpu_ctrl is None:
+            gpu_power = None
+        elif gpu_ctrl & GPU_CTRL_ENABLE:
+            gpu_power = GPU_BASE_POWER + (gpu_ctgp or 0) + (gpu_db or 0)
+        else:
+            gpu_power = GPU_BASE_POWER
 
         if perf not in (None, 0):
             self._last_perf_mode = perf_mode_from_value(perf)
@@ -303,6 +454,11 @@ class AcpiEc:
                 else None
             ),
             ap_oem=ap_oem,
+            gpu_power=gpu_power,
+            gpu_control=gpu_ctrl,
+            gpu_ctgp=gpu_ctgp,
+            gpu_db=gpu_db,
+            fan_table=fan_table,
         )
         if errors:
             state["error"] = "; ".join(errors)
@@ -340,6 +496,102 @@ class AcpiEc:
             )
         self._last_perf_mode = mode
         return {"perf_value": readback, "perf_mode": mode}
+
+    def set_gpu_power(self, watts: int) -> dict:
+        """Set the GPU power ceiling (80/100/125/145 W on this model).
+
+        The EC owns the budget; the NVIDIA driver picks it up without a
+        reload.  Values are only written after a project-id check so the
+        action refuses to run on a different Uniwill machine.
+        """
+        if self.read(EC_PROJECT_ID) != 0x08:
+            raise ECError("GPU power control is only supported on the LAPKC71F")
+        current = self.read(EC_GPU_TGP_CONTROL)
+        writes = gpu_power_registers(watts, current)
+        for address in (EC_GPU_CTGP, EC_GPU_DB_CAP, EC_GPU_DB_WATT):
+            self.write(address, writes[address])
+        self.write(EC_GPU_TGP_CONTROL, writes[EC_GPU_TGP_CONTROL])
+        time.sleep(0.3)
+        observed = {address: self.read(address) for address in writes}
+        if any(observed[address] != value for address, value in writes.items()):
+            raise ECError("the EC did not accept the GPU power limit")
+        return {
+            "gpu_power": watts,
+            "gpu_control": observed[EC_GPU_TGP_CONTROL],
+            "gpu_ctgp": observed[EC_GPU_CTGP],
+            "gpu_db": observed[EC_GPU_DB_WATT],
+        }
+
+    def set_power_profile(self, mode: str, apply_fan: bool = True) -> dict:
+        """Apply a full Windows-style profile (CPU PL, GPU TGP, fan, LED).
+
+        ``apply_fan=False`` keeps the EC fan table in charge when the user
+        has enabled a custom curve.
+        """
+        if mode not in POWER_PROFILES:
+            raise ValueError(f"unknown power profile: {mode}")
+        profile = POWER_PROFILES[mode]
+        gpu = self.set_gpu_power(profile["gpu_power"])
+        self.write(EC_CPU_PL1, profile["pl1"])
+        self.write(EC_CPU_PL2, profile["pl2"])
+        if apply_fan:
+            fan = self.read(EC_MANUAL_FAN_CTRL)
+            self.write(
+                EC_MANUAL_FAN_CTRL,
+                (fan & ~PERF_MODE_MASK & 0xFF) | profile["fan"],
+            )
+            led = self.read(EC_MODE_LED)
+            self.write(EC_MODE_LED, (led & 0xF0) | profile["led"])
+        self._last_perf_mode = mode
+        return {
+            "perf_mode": mode,
+            "gpu_power": profile["gpu_power"],
+            "pl1": profile["pl1"],
+            "pl2": profile["pl2"],
+            "gpu": gpu,
+        }
+
+    def set_fan_table(self, points) -> dict:
+        """Upload a fan curve and let the EC execute it autonomously.
+
+        The sequence matches NUCtool: manual mode is bit 6 of 0x0751 cleared,
+        0x07C5 bit 7 enables the split CPU/GPU tables, 0x07C6 bit 2 enables
+        the table engine, and duty slot 0 must be 0 (0xFF means "EC auto").
+        """
+        writes = fan_table_writes(points)
+        mode = self.read(EC_MANUAL_FAN_CTRL)
+        # The table only runs in Normal mode: clear Turbo/High/User.  The
+        # mode LED low nibble also forces a fan mode (1 -> Turbo), so keep
+        # it at Standard while the custom table is in charge.
+        if mode & PERF_MODE_MASK:
+            self.write(EC_MANUAL_FAN_CTRL, mode & ~PERF_MODE_MASK & 0xFF)
+        led = self.read(EC_MODE_LED)
+        if led & 0x0F != 0x02:
+            self.write(EC_MODE_LED, (led & 0xF0) | 0x02)
+        ap_oem = self.read(EC_AP_OEM)
+        if not ap_oem & AP_OEM_ENABLE_MANUAL_CTRL:
+            self.write(EC_AP_OEM, ap_oem | AP_OEM_ENABLE_MANUAL_CTRL)
+        self.write(EC_FAN_SPLIT, EC_FAN_SPLIT_ENABLE)
+        self.write(EC_FAN_TABLE_ENABLE, EC_FAN_TABLE_ENABLE_BIT)
+        for address, value in writes:
+            self.write(address, value)
+        time.sleep(0.05)
+        self._fan_table_active = True
+        return {"fan_table": True, "fan_points": len(writes) // 6 - 1}
+
+    def clear_fan_table(self) -> dict:
+        """Hand the fans back to the EC's built-in curve."""
+        self.write(EC_FAN_CPU_DUTY, 0xFF)
+        self.write(EC_FAN_GPU_DUTY, 0xFF)
+        for index in range(16):
+            self.write(EC_FAN_CPU_UP + index, 0)
+            self.write(EC_FAN_CPU_DOWN + index, 0)
+            self.write(EC_FAN_GPU_UP + index, 0)
+            self.write(EC_FAN_GPU_DOWN + index, 0)
+        self.write(EC_FAN_SPLIT, 0)
+        self.write(EC_FAN_TABLE_ENABLE, 0)
+        self._fan_table_active = False
+        return {"fan_table": False}
 
     def set_fan_boost(self, enabled: bool) -> dict:
         current = bool(self.read(EC_SWITCH_STATUS) & SWITCH_FAN_BOOST)

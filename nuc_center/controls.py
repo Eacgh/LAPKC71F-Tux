@@ -28,6 +28,11 @@ class ControlError(RuntimeError):
 _ERROR_ZH = (
     ("EC access is unavailable", "EC 访问不可用"),
     ("the EC did not accept the performance mode", "EC 未接受性能模式"),
+    ("this EC has no separate quiet mode", "此机型的 EC 没有独立的安静模式"),
+    ("the EC did not accept the GPU power limit", "EC 未接受显卡功耗上限"),
+    ("GPU power control is not supported on this device", "此设备不支持显卡功耗控制"),
+    ("GPU power control is only supported on the LAPKC71F", "显卡功耗控制仅支持 LAPKC71F"),
+    ("unsupported GPU power limit", "不支持的显卡功耗上限"),
     ("the EC did not change the fan boost state", "EC 未切换风扇加速状态"),
     ("no Uniwill lightbar LED found", "未找到 Uniwill 灯带 LED"),
     ("no keyboard backlight LED exposed by the kernel", "内核未暴露键盘背光 LED"),
@@ -253,6 +258,9 @@ class ControlManager:
 
     def set_profile(self, mode: str) -> dict:
         return self._call("set_profile", mode=mode)
+
+    def set_gpu_power(self, watts: int) -> dict:
+        return self._call("set_gpu_power", watts=int(watts))
 
     def set_fan_boost(self, enabled: bool) -> dict:
         return self._call("set_fan_boost", enabled=bool(enabled))

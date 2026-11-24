@@ -7,19 +7,36 @@ never accepts arbitrary paths or raw EC writes from the GUI.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Optional
 
 from .ite import IteError, IteKeyboard
-from .fan import FanCurveController, FanGuard, FanPwm
+from .fan import (
+    FanCurveController,
+    FanGuard,
+    FanPwm,
+    interpolate,
+    normalize_points,
+    read_max_temp,
+    safe_percent,
+)
 from .ec import (
     ECError,
+    GPU_POWER_MODES,
+    POWER_PROFILES,
     KBD_MAX_LEVEL,
     LIGHTBAR_MAX_INTENSITY,
     NUC_PERF_MODE_VALUES,
     AcpiEc,
 )
 from .util import clamp, read_int, read_text, run_command, write_text
+
+# Persisted GPU power choice, re-applied when the helper starts (the EC
+# resets 0x0743 at boot).
+GPU_POWER_STATE = Path("/var/lib/nuc-center/gpu-power")
+FAN_CURVE_STATE = Path("/var/lib/nuc-center/fan-curve.json")
+POWER_PROFILE_STATE = Path("/var/lib/nuc-center/power-profile")
 
 
 def _find_led(*names: str) -> Optional[Path]:
@@ -91,10 +108,68 @@ class PrivilegedBackend:
 
         self._ec_state: dict = {}
         self._ec_checked = False
+        self._gpu_power_error: Optional[str] = None
+        self._fan_points: list[dict] = []
+        self._fan_enabled = False
+        self._fan_curve_error: Optional[str] = None
+        # The BIOS resets 0x0743 on every boot, so re-apply the last choice
+        # the user made in the GUI (or with tools/gpu-power.py).
+        self._apply_saved_gpu_power()
+        self._apply_saved_power_profile()
+        self._load_saved_fan_curve()
 
     # ------------------------------------------------------------------
     # capability discovery
     # ------------------------------------------------------------------
+    def _save_fan_curve(self, points, enabled: bool) -> None:
+        payload = {
+            "enabled": bool(enabled),
+            "points": [point.as_dict() for point in points],
+        }
+        try:
+            FAN_CURVE_STATE.parent.mkdir(parents=True, exist_ok=True)
+            FAN_CURVE_STATE.write_text(json.dumps(payload), encoding="utf-8")
+        except OSError:
+            pass
+
+    def _load_saved_fan_curve(self) -> None:
+        try:
+            payload = json.loads(FAN_CURVE_STATE.read_text(encoding="utf-8"))
+            points = normalize_points(payload.get("points") or [])
+        except (OSError, ValueError, TypeError):
+            return
+        self._fan_points = [point.as_dict() for point in points]
+        if not payload.get("enabled") or not self.product.startswith("LAPKC"):
+            return
+        try:
+            self.ec.set_fan_table(points)
+            self._fan_enabled = True
+        except ECError as exc:
+            self._fan_curve_error = str(exc)
+
+    def _apply_saved_power_profile(self) -> None:
+        try:
+            mode = POWER_PROFILE_STATE.read_text(encoding="utf-8").strip()
+        except OSError:
+            return
+        if mode not in POWER_PROFILES:
+            return
+        try:
+            self.ec.set_power_profile(mode)
+        except ECError as exc:
+            self._gpu_power_error = str(exc)
+
+    def _apply_saved_gpu_power(self) -> None:
+        try:
+            watts = int(GPU_POWER_STATE.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            return
+        if watts not in GPU_POWER_MODES:
+            return
+        try:
+            self.ec.set_gpu_power(watts)
+        except ECError as exc:
+            self._gpu_power_error = str(exc)
     def ec_state(self, refresh: bool = False) -> dict:
         if refresh or not self._ec_checked:
             self._ec_state = self.ec.read_state()
@@ -135,6 +210,13 @@ class PrivilegedBackend:
                 self.platform and (self.platform / "breathing_in_suspend").exists()
             ),
             "profile": bool(ec_ok and state.get("perf_value") is not None),
+            # The NUC X15 puts the GPU power budget in the EC; every other
+            # model keeps it in the vBIOS/driver.
+            "gpu_power": bool(
+                ec_ok
+                and self.product.startswith("LAPKC")
+                and state.get("gpu_control") is not None
+            ),
             # The NUC X15 supports the persistent fan-boost bit even though
             # its SUPPORT_5 register does not advertise it.
             "fan_boost": bool(
@@ -145,7 +227,10 @@ class PrivilegedBackend:
                 )
             ),
             "fan_guard": bool(ec_ok and self.product.startswith("LAPKC")),
-            "fan_curve": bool(self.fan_pwm.available),
+            "fan_curve": bool(
+                (ec_ok and self.product.startswith("LAPKC"))
+                or self.fan_pwm.available
+            ),
             "kbd_white_only": bool(state.get("kbd_white_only")),
             "kbd_max_level": KBD_MAX_LEVEL,
             "lightbar_max_intensity": self._light_max_intensity(),
@@ -208,7 +293,7 @@ class PrivilegedBackend:
             "ec": ec,
             "ite": self.ite.state(),
             "fan_guard": self.fan_guard.state(),
-            "fan_curve": self.fan_curve.state(),
+            "fan_curve": self._fan_curve_state(ec),
         }
 
     # ------------------------------------------------------------------
@@ -293,11 +378,40 @@ class PrivilegedBackend:
         state = self.ec_state()
         if not state.get("ec"):
             raise ECError("EC access is unavailable")
-        values = NUC_PERF_MODE_VALUES if self.product.startswith("LAPKC") else None
-        result = self.ec.set_perf_mode(mode, values=values)
+        if self.product.startswith("LAPKC"):
+            result = self.ec.set_power_profile(mode, apply_fan=not self._fan_enabled)
+            try:
+                POWER_PROFILE_STATE.parent.mkdir(parents=True, exist_ok=True)
+                POWER_PROFILE_STATE.write_text(mode + "\n", encoding="utf-8")
+            except OSError:
+                pass
+        else:
+            values = NUC_PERF_MODE_VALUES
+            result = self.ec.set_perf_mode(mode, values=values)
         try:
             self._perf_cache.parent.mkdir(parents=True, exist_ok=True)
             self._perf_cache.write_text(mode + "\n", encoding="utf-8")
+        except OSError:
+            pass
+        self._ec_checked = False
+        return result
+
+    def set_gpu_power(self, watts: int) -> dict:
+        state = self.ec_state()
+        if not state.get("ec"):
+            raise ECError("EC access is unavailable")
+        if not self.product.startswith("LAPKC"):
+            raise ECError("GPU power control is not supported on this device")
+        try:
+            watts = int(watts)
+        except (TypeError, ValueError):
+            raise ECError("unsupported GPU power limit")
+        if watts not in GPU_POWER_MODES:
+            raise ECError("unsupported GPU power limit")
+        result = self.ec.set_gpu_power(watts)
+        try:
+            GPU_POWER_STATE.parent.mkdir(parents=True, exist_ok=True)
+            GPU_POWER_STATE.write_text(f"{watts}\n", encoding="utf-8")
         except OSError:
             pass
         self._ec_checked = False
@@ -322,10 +436,58 @@ class PrivilegedBackend:
         self.fan_guard.threshold = threshold
         return {"fan_guard": self.fan_guard.stop()}
 
+    def _fan_curve_state(self, ec: dict) -> dict:
+        points = self._fan_points
+        temperature = read_max_temp()
+        enabled = self._fan_enabled
+        if ec.get("fan_table") is not None:
+            # The EC keeps executing the last uploaded table until someone
+            # clears it, even across helper restarts.
+            enabled = enabled or bool(ec.get("fan_table"))
+        if not points:
+            return {
+                "enabled": enabled,
+                "source": "ec_table" if self.product.startswith("LAPKC") else "pwm",
+                "points": [],
+                "temp": temperature,
+                "percent": None,
+                "target": None,
+            }
+        return {
+            "enabled": enabled,
+            "source": "ec_table" if self.product.startswith("LAPKC") else "pwm",
+            "points": [dict(point) for point in points],
+            "temp": temperature,
+            "percent": interpolate(points, temperature),
+            "target": safe_percent(points, temperature),
+        }
+
     def set_fan_curve(self, points, enabled: bool) -> dict:
+        state = self.ec_state()
+        if self.product.startswith("LAPKC") and state.get("ec"):
+            if enabled:
+                curve = normalize_points(points)
+                self.ec.set_fan_table(curve)
+                self._fan_points = [point.as_dict() for point in curve]
+                self._fan_enabled = True
+                self._save_fan_curve(curve, True)
+            else:
+                self.ec.clear_fan_table()
+                curve = normalize_points(points)
+                self._fan_points = [point.as_dict() for point in curve]
+                self._fan_enabled = False
+                # Hand fans and the mode LED back to the selected profile.
+                mode = self._last_perf_mode or "balanced"
+                try:
+                    self.ec.set_power_profile(mode, apply_fan=True)
+                except ECError:
+                    pass
+                self._save_fan_curve(curve, False)
+            self._ec_checked = False
+            return {"fan_curve": self._fan_curve_state(self.ec_state(refresh=True))}
         if enabled:
             if not self.fan_pwm.available:
-                raise ECError("风扇曲线模块未加载（/dev/uniwill_pwm 不存在）")
+                raise ECError("EC fan table is unavailable")
             if self.fan_curve.enabled:
                 return {"fan_curve": self.fan_curve.update_points(points)}
             self.fan_guard.stop()
@@ -406,6 +568,8 @@ class PrivilegedBackend:
             }
         if command == "set_profile":
             return {"profile": self.set_profile(params["mode"])}
+        if command == "set_gpu_power":
+            return {"gpu_power": self.set_gpu_power(int(params["watts"]))}
         if command == "set_fan_boost":
             return {"fan_boost": self.set_fan_boost(bool(params["enabled"]))}
         if command == "set_fan_guard":
